@@ -51,18 +51,24 @@ podman-compose --version
 
 echo "▸ 4/6 스택 기동 (postgres / redis / qdrant / opensearch / ollama / kms)"
 cd "$COMPOSE_DIR"
+# podman-compose 1.5 가 docker-compose 의 !reset YAML tag 미지원이라 override 패턴 안 씀.
+# A100 용 standalone compose 파일 하나만 사용.
 podman-compose \
   --env-file "$ENV_FILE" \
-  -f docker-compose.dev.yml \
-  -f docker-compose.a100.yml \
+  -f docker-compose.a100-standalone.yml \
   up -d postgres redis qdrant opensearch ollama kms
 
 echo "  postgres healthy 대기..."
+# podman-compose 의 container 이름 패턴: 'genofinder-dev_postgres_1' 또는 'genofinder-dev-postgres-1'
+# 어느 쪽이든 grep 으로 발견.
 for i in $(seq 1 60); do
-  status=$(podman inspect --format='{{.State.Health.Status}}' genofinder-dev-postgres 2>/dev/null || true)
-  if [ "$status" = "healthy" ]; then
-    echo "  ✓ postgres healthy (${i}s)"
-    break
+  pg_container=$(podman ps --format '{{.Names}}' | grep -E 'postgres' | head -1)
+  if [ -n "$pg_container" ]; then
+    status=$(podman inspect --format='{{.State.Health.Status}}' "$pg_container" 2>/dev/null || true)
+    if [ "$status" = "healthy" ]; then
+      echo "  ✓ postgres healthy (${i}s) — container=$pg_container"
+      break
+    fi
   fi
   sleep 1
 done
@@ -74,10 +80,15 @@ ALEMBIC_DATABASE_URL="postgresql+asyncpg://genofinder:${POSTGRES_PASSWORD:-devpa
 echo "  ✓ 마이그레이션 0001~0004 적용"
 
 echo "▸ 6/6 모델 pull (Gemma 3 27B + Qwen3-Embedding 8B + Qwen3-Reranker 0.6B)"
+ollama_container=$(podman ps --format '{{.Names}}' | grep -E 'ollama' | head -1)
+if [ -z "$ollama_container" ]; then
+  echo "  ⚠ ollama container 안 떠있음. 'podman ps' 확인 후 수동 pull"
+  exit 1
+fi
 echo "  → Gemma 3 27B IT BF16 (~54GB 다운로드, 10-20분)"
-podman exec genofinder-dev-ollama ollama pull gemma3:27b-it-bf16
+podman exec "$ollama_container" ollama pull gemma3:27b-it-bf16
 echo "  → Qwen3-Embedding-8B (~16GB)"
-podman exec genofinder-dev-ollama ollama pull qwen3-embedding:8b
+podman exec "$ollama_container" ollama pull qwen3-embedding:8b
 # Qwen3-Reranker 는 Ollama 미공식 — sentence-transformers 가 첫 호출 시 자동 다운로드 (~1GB to HF cache)
 
 echo ""

@@ -1,0 +1,93 @@
+# A100 서버 standalone compose — podman-compose 호환 (override 패턴 없음).
+#
+# ADR 0006 + migration_v2.md
+#
+# 차이점 (docker-compose.dev.yml 대비):
+# - Named volume 대신 NFS bind mount (`$GENOFINDER_DATA_ROOT/*`)
+# - Ollama 컨테이너에 GPU 노출 (`nvidia.com/gpu=$NVIDIA_GPU_DEVICE_ID`)
+# - 모델 환경변수: Gemma 3 27B BF16 + Qwen3-Embedding-8B
+# - podman rootless 호환 (호스트 port forwarding bind 0.0.0.0)
+#
+# 사용:
+#   cd ~/genofinder/infra/compose
+#   podman-compose --env-file ../../.env -f docker-compose.a100-standalone.yml up -d
+#
+# 사전 준비:
+#   pip install --user podman-compose
+#   mkdir -p $GENOFINDER_DATA_ROOT/{ollama-models,postgres-data,qdrant-data,opensearch-data,redis-data,kms-data}
+
+name: genofinder-dev
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: genofinder
+      POSTGRES_USER: genofinder
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/postgres-data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U genofinder"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/redis-data:/data
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/qdrant-data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD:-DevAdmin!1}
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/ollama-models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    # ADR 0006: A100 GPU 단일 device. nvidia-container-toolkit v1.13.5+ CDI.
+    devices:
+      - nvidia.com/gpu=${NVIDIA_GPU_DEVICE_ID:-3}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_GPU_DEVICE_ID:-3}
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+
+  kms:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: kms
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    volumes:
+      - ${GENOFINDER_DATA_ROOT}/kms-data:/var/lib/localstack

@@ -147,18 +147,22 @@ say "6/6 Dump 생성 (pg_dump + Qdrant snapshot + Redis RDB)"
 DUMP_DIR="${GENOFINDER_DATA_ROOT}/dumps/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$DUMP_DIR"
 
-podman exec genofinder-dev-postgres \
-  pg_dump -U genofinder genofinder | gzip > "$DUMP_DIR/db.sql.gz"
+# podman-compose 의 container 이름은 docker-compose 와 다를 수 있어 동적 lookup.
+PG_C=$(podman ps --format '{{.Names}}' | grep -E 'postgres' | head -1)
+QD_C=$(podman ps --format '{{.Names}}' | grep -E 'qdrant' | head -1)
+RD_C=$(podman ps --format '{{.Names}}' | grep -E 'redis' | head -1)
+
+podman exec "$PG_C" pg_dump -U genofinder genofinder | gzip > "$DUMP_DIR/db.sql.gz"
 echo "  ✓ db.sql.gz: $(du -h $DUMP_DIR/db.sql.gz | cut -f1)"
 
 # Qdrant snapshot
 SNAP=$(curl -s -X POST localhost:6333/collections/datasets_v2/snapshots | jq -r .result.name)
-podman cp genofinder-dev-qdrant:/qdrant/snapshots/datasets_v2/$SNAP "$DUMP_DIR/"
+podman cp "$QD_C":/qdrant/snapshots/datasets_v2/$SNAP "$DUMP_DIR/"
 echo "  ✓ qdrant snapshot: $SNAP"
 
 # Redis RDB (translate cache)
-podman exec genofinder-dev-redis redis-cli SAVE >/dev/null
-podman cp genofinder-dev-redis:/data/dump.rdb "$DUMP_DIR/redis-dump.rdb"
+podman exec "$RD_C" redis-cli SAVE >/dev/null
+podman cp "$RD_C":/data/dump.rdb "$DUMP_DIR/redis-dump.rdb"
 echo "  ✓ redis-dump.rdb: $(du -h $DUMP_DIR/redis-dump.rdb | cut -f1)"
 
 # 합본

@@ -1,0 +1,6 @@
+# 본 파일은 Week 9 보안 가시성 PR 에서 정식 서명·연락처와 함께 채워집니다.
+# 마스터 플랜 §12.12 / ADR 0002 Cross-Cutting Controls 참조.
+# Contact: TODO
+# Expires: TODO
+# Preferred-Languages: ko, en
+# Canonical: https://TODO/.well-known/security.txt

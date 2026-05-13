@@ -1,0 +1,193 @@
+# Geno Finder — Security CI Gates
+# 마스터 플랜 §12.14 / ADR 0002 의 6개 gate 를 PR 레벨에서 강제한다.
+# 본 PR 단계에서는 골격만 — 각 gate 는 해당 마일스톤에서 채워진다.
+
+name: security-gates
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # T9 — 의존성 audit
+  dependency-audit:
+    name: pip-audit + npm audit + trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: pip-audit (api)
+        run: |
+          cd apps/api
+          uv venv .venv
+          # TODO(verify): 의존성이 채워진 뒤 활성화
+          # uv pip install -e .[dev]
+          # uv run pip-audit --strict
+          echo "TODO: enable after dependencies are pinned (Week 1 후속)"
+      - name: pip-audit (workers)
+        run: |
+          cd apps/workers
+          uv venv .venv
+          # uv run pip-audit --strict
+          echo "TODO: enable after dependencies are pinned"
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Enable corepack
+        run: corepack enable && corepack prepare pnpm@9 --activate
+      - name: pnpm audit (web)
+        run: |
+          cd apps/web
+          # TODO(verify): pnpm-lock.yaml 이 만들어진 뒤 활성화
+          # pnpm install --frozen-lockfile
+          # pnpm audit --audit-level=critical
+          echo "TODO: enable after pnpm-lock.yaml exists"
+      - name: Trivy fs scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # T9 — 시크릿 스캔
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # T2 — 외부 LLM SDK import 차단 (ADR 0003)
+  no-external-llm:
+    name: no external LLM SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run semgrep (no-external-llm rule)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: infra/lint/no-external-llm.yml
+
+  # T4 — Cross-tenant access 통합 테스트 (실제 동작)
+  cross-tenant:
+    name: cross-tenant access (T4)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_DB: genofinder
+          POSTGRES_USER: genofinder
+          POSTGRES_PASSWORD: devpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U genofinder"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap genofinder_app role (postgres-init.sql)
+        env:
+          PGPASSWORD: devpassword
+        run: |
+          # GitHub Actions 의 service container 는 docker-entrypoint-initdb.d 를 사용할 수 없으므로
+          # init SQL 을 수동으로 적용. 운영·로컬 dev 와 동일한 결과.
+          psql -h localhost -U genofinder -d genofinder -f infra/compose/postgres-init.sql
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv
+      - name: Install api deps
+        working-directory: apps/api
+        run: uv sync --frozen
+      - name: Apply migrations (as superuser)
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql+asyncpg://genofinder:devpassword@localhost:5432/genofinder
+          ALEMBIC_DATABASE_URL: postgresql+asyncpg://genofinder:devpassword@localhost:5432/genofinder
+        run: uv run alembic upgrade head
+      - name: Run cross-tenant test suite (as NOSUPERUSER role)
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql+asyncpg://genofinder_app:devpassword@localhost:5432/genofinder
+          ALEMBIC_DATABASE_URL: postgresql+asyncpg://genofinder:devpassword@localhost:5432/genofinder
+        run: uv run pytest tests/security/test_cross_tenant.py -v
+
+  # T3 — Log redaction 합성 마커 grep — 실제 작동
+  log-redaction:
+    name: log redaction (T3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv
+      - name: Install api deps
+        working-directory: apps/api
+        run: uv sync --frozen
+      - name: Run redaction test suite (10 tests)
+        working-directory: apps/api
+        run: uv run pytest tests/security/test_redaction.py -v
+
+  # T1 — Envelope encryption round-trip — 실제 작동 (LocalStack KMS service)
+  envelope-encryption:
+    name: envelope encryption round-trip (T1)
+    runs-on: ubuntu-latest
+    services:
+      kms:
+        image: localstack/localstack:3
+        env:
+          SERVICES: kms
+          DEBUG: "0"
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 5s --health-timeout 3s --health-retries 10 --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv
+      - name: Install api deps
+        working-directory: apps/api
+        run: uv sync --frozen
+      - name: Run envelope encryption tests (7 tests)
+        working-directory: apps/api
+        env:
+          KMS_ENDPOINT_URL: http://localhost:4566
+        run: uv run pytest tests/security/test_envelope_encryption.py -v
+
+  # T8 — Prompt injection regression (Layer A: defense-in-depth, no LLM)
+  prompt-injection:
+    name: prompt injection regression (T8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install uv
+      - name: Install workers deps
+        working-directory: apps/workers
+        run: uv sync --frozen
+      - name: Run injection regression (no Ollama needed for Layer A)
+        working-directory: apps/workers
+        run: |
+          # Layer A 만 — _build_prompt / _parse_response / _validate_modality 정적 검증
+          # Layer B (실제 LLM) 는 ollama 가 reachable 한 환경에서만 — 별도 nightly job 으로 분리.
+          uv run pytest tests/test_prompt_injection.py -v -m "not integration"

@@ -1,0 +1,177 @@
+# Geno Finder — local dev compose
+#
+# 보안 운영 (ADR 0003):
+#   - Ollama 컨테이너는 host 로 포트 publish 하지 않는다 (internal docker network only).
+#   - LocalStack KMS dev 모드. 운영 환경에서는 클라우드 KMS 로 교체.
+#   - Postgres 는 SUPERUSER 계정과 app 계정을 분리해야 하지만, dev 단계에서는 단일 계정.
+#     Week 2 마이그레이션 PR 에서 RLS FORCE 와 함께 권한 분리.
+#
+# 버전 핀 정책 (§0.1):
+#   - 명시 핀이 없는 image 는 TODO(verify) — 후속 PR 에서 정확한 tag 로 고정.
+
+name: genofinder-dev
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: genofinder
+      POSTGRES_USER: genofinder            # superuser — 마이그레이션 전용
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # ADR 0002 T4: NOSUPERUSER 앱 role(genofinder_app) 을 최초 init 시 생성
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U genofinder"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    # TODO(verify): qdrant/qdrant 의 latest stable tag 를 PyPI 클라이언트 1.17.1 호환 매트릭스에서 확인 후 핀.
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  opensearch:
+    # TODO(verify): opensearchproject/opensearch latest stable + opensearch-py 3.2.0 호환 매트릭스 확인.
+    image: opensearchproject/opensearch:2
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD:-DevAdmin!1}
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"  # dev only — prod에서는 mTLS + 권한 분리
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+
+  ollama:
+    image: ollama/ollama:latest  # TODO(verify): 정확한 tag 핀 — ADR 0003 후속.
+    volumes:
+      - ollama_models:/root/.ollama
+    # ADR 0003: 외부 노출 금지. localhost(127.0.0.1) 전용 바인드만 dev 편의로 허용.
+    # 운영 환경에서는 ports 자체를 제거 — internal docker network 만 접근.
+    ports:
+      - "127.0.0.1:11434:11434"
+    # GPU 사용 시 deploy.resources.reservations.devices 추가:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  kms:
+    # LocalStack Community LTS (무료). 'latest' 는 Pro 로 전환되어 라이선스 요구 — pin 필요.
+    # 참고: https://hub.docker.com/r/localstack/localstack/tags (community LTS = '3')
+    image: localstack/localstack:3
+    environment:
+      SERVICES: kms
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    volumes:
+      - kms_data:/var/lib/localstack
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_started }
+      qdrant:   { condition: service_started }
+      opensearch: { condition: service_started }
+      ollama:   { condition: service_started }
+      kms:      { condition: service_started }
+    environment:
+      # 앱 런타임 — NOSUPERUSER role (RLS 적용 대상)
+      DATABASE_URL: postgresql+asyncpg://genofinder_app:devpassword@postgres:5432/genofinder
+      # 마이그레이션 — superuser (스키마·정책 변경 권한)
+      ALEMBIC_DATABASE_URL: postgresql+asyncpg://genofinder:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/genofinder
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OPENSEARCH_URL: http://opensearch:9200
+      OLLAMA_URL: http://ollama:11434
+      KMS_PROVIDER: localstack
+      KMS_ENDPOINT_URL: http://kms:4566
+      # ADR 0005: Firebase Admin SDK 가 token 검증에 사용할 service-account JSON.
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-admin.json
+    volumes:
+      # host 의 service-account JSON 을 read-only 로 마운트. .env 의 host path 참조.
+      - ${FIREBASE_ADMIN_CREDENTIALS_HOST_PATH}:/run/secrets/firebase-admin.json:ro
+    ports:
+      - "8000:8000"
+
+  workers:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.workers
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_started }
+      qdrant:   { condition: service_started }
+      opensearch: { condition: service_started }
+      ollama:   { condition: service_started }
+    environment:
+      DATABASE_URL: postgresql+asyncpg://genofinder:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/genofinder
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OPENSEARCH_URL: http://opensearch:9200
+      OLLAMA_URL: http://ollama:11434
+      NCBI_EUTILS_API_KEY: ${NCBI_EUTILS_API_KEY:-}
+    command: ["-A", "src.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+
+  beat:
+    # 정기 task 트리거 (UTC 기반 cron). worker 와 분리 — 한 인스턴스만 띄워야 함.
+    # workers 와 같은 이미지 사용 — 별도 빌드 안 함.
+    image: genofinder-dev-workers:latest
+    pull_policy: never
+    depends_on:
+      redis: { condition: service_started }
+    environment:
+      DATABASE_URL: postgresql+asyncpg://genofinder:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/genofinder
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OPENSEARCH_URL: http://opensearch:9200
+      OLLAMA_URL: http://ollama:11434
+      NCBI_EUTILS_API_KEY: ${NCBI_EUTILS_API_KEY:-}
+    command: ["-A", "src.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+    depends_on:
+      api: { condition: service_started }
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000/api/v1
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  opensearch_data:
+  ollama_models:
+  kms_data:

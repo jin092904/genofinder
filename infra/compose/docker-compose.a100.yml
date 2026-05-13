@@ -1,0 +1,93 @@
+# A100 server override — ADR 0006 + migration_v2.md
+#
+# 사용 (podman-compose 또는 docker-compose):
+#   cd genofinder/infra/compose
+#   podman-compose --env-file ../../.env \
+#                  -f docker-compose.dev.yml \
+#                  -f docker-compose.a100.yml \
+#                  up -d
+#
+# 차이점:
+#   - Ollama 컨테이너에 NVIDIA GPU 3번 노출 (CDI device)
+#   - 모델 storage 를 NFS 로 이동 (로컬 71GB 회피)
+#   - DB / Qdrant / OpenSearch / Redis 도 NFS volume 으로 (다른 사용자와 격리 + 영구 보존)
+#   - 환경변수: 추출은 Gemma 3 27B BF16, embed 는 Qwen3-8B
+#   - LocalStack KMS 는 dev 환경 그대로 (논문 데모용)
+#
+# 사전 준비 (사용자 host 에서 1회):
+#   mkdir -p /home/sosa8770/genofinder/{ollama-models,postgres-data,qdrant-data,opensearch-data,redis-data,kms-data}
+#   pip install --user podman-compose
+#
+# .env 추가 변수 (host 환경):
+#   GENOFINDER_DATA_ROOT=/home/sosa8770/genofinder   # NFS 마운트
+#   NVIDIA_GPU_DEVICE_ID=3                            # 사용 가능한 GPU 번호
+
+services:
+  postgres:
+    volumes:
+      - !reset []                        # docker-compose.dev.yml 의 named volume 제거
+      - ${GENOFINDER_DATA_ROOT}/postgres-data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+
+  redis:
+    volumes:
+      - !reset []
+      - ${GENOFINDER_DATA_ROOT}/redis-data:/data
+
+  qdrant:
+    volumes:
+      - !reset []
+      - ${GENOFINDER_DATA_ROOT}/qdrant-data:/qdrant/storage
+
+  opensearch:
+    volumes:
+      - !reset []
+      - ${GENOFINDER_DATA_ROOT}/opensearch-data:/usr/share/opensearch/data
+
+  kms:
+    volumes:
+      - !reset []
+      - ${GENOFINDER_DATA_ROOT}/kms-data:/var/lib/localstack
+
+  ollama:
+    volumes:
+      - !reset []
+      - ${GENOFINDER_DATA_ROOT}/ollama-models:/root/.ollama
+    # ADR 0006: A100 GPU 단일 device (3번 비어있음). podman 에서 nvidia CDI device 사용.
+    # CDI 명 'nvidia.com/gpu=N' 은 nvidia-container-toolkit v1.13.5+ 에서 표준.
+    devices:
+      - nvidia.com/gpu=${NVIDIA_GPU_DEVICE_ID:-3}
+    environment:
+      # ollama 가 GPU 1장만 사용하도록 (host 의 다른 GPU 영향 없음)
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_GPU_DEVICE_ID:-3}
+      OLLAMA_KEEP_ALIVE: "30m"   # 모델 swap 비용 줄이려고 30분 keep-alive
+      OLLAMA_NUM_PARALLEL: "1"   # batch 라 parallelism 1
+      OLLAMA_MAX_LOADED_MODELS: "1"  # 한 번에 한 모델만 (Gemma 27B 54GB → 다른 모델과 동시 부적합)
+    # podman rootless 에서 host network 직접 사용 (slirp4netns 우회) — A100 LAN 내부면 안전.
+    # 또는 기본 bridge 두면 됨. 안전 default: bridge 유지.
+
+  api:
+    environment:
+      # A100 batch 측: Gemma 3 27B BF16 (추출 + 번역 + cohort)
+      OLLAMA_MODEL_EXTRACTION: gemma3:27b-it-bf16
+      OLLAMA_MODEL_EMBED: qwen3-embedding:8b
+      # CORS: 같은 서버에서 web 도 띄우면 localhost:3000 OK. 외부 데모면 host IP 추가.
+      ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+    # API 자체는 GPU 불필요 — reranker 가 sentence-transformers 로 모델 직접 load.
+    # Qwen3-Reranker-0.6B 도 작아서 CPU OK, GPU 가 있으면 자동 사용.
+
+  workers:
+    environment:
+      OLLAMA_MODEL_EXTRACTION: gemma3:27b-it-bf16
+      OLLAMA_MODEL_EMBED: qwen3-embedding:8b
+      NCBI_EUTILS_API_KEY: ${NCBI_EUTILS_API_KEY:-}
+
+  beat:
+    environment:
+      OLLAMA_MODEL_EXTRACTION: gemma3:27b-it-bf16
+      OLLAMA_MODEL_EMBED: qwen3-embedding:8b
+
+  web:
+    environment:
+      # 같은 호스트에서 api 컨테이너로 proxy
+      NEXT_PUBLIC_API_URL: http://api:8000/api/v1

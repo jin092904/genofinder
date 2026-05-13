@@ -1,8 +1,17 @@
 # Geno Finder 진행 현황
 
-작성일: 2026-05-12
+작성일: 2026-05-12 (v0.8) · 2026-05-13 (v1.0 batch 진행 중)
 
-## 한 줄 요약
+## v1.0 한 줄 요약 (2026-05-13)
+
+ADR 0006 의 새 모델 stack (**Gemma 4 31B Q4** + **Qwen3-Embedding-8B** Matryoshka 1024d +
+**Qwen3-Reranker-0.6B**) 으로 v1.0 코퍼스 재구축 진행 중. 학내 A100 GPU 1장 단독 운영 +
+**컨테이너 폐기 native 배포** (podman rootless 의 subuid/CDI 제약 회피). 1-cycle batch 약
+14-20시간, 약 10,621 datasets 목표. **논문 초안 (`docs/PAPER_DRAFT.md`) v1.0 갱신 완료** (928줄,
++579 줄 added — abstract / methods I-II / impl / eval / discussion / appendix C model
+comparison raw data).
+
+## v0.8 한 줄 요약 (2026-05-12, 참고)
 
 공공 생명정보 데이터셋(GEO/HCA/GDC/SRA) **10,763건** 을 인덱싱한 하이브리드 검색 시스템.
 프론트엔드/백엔드/검색/인증 핵심 기능 모두 동작 + 데이터셋 상세 페이지에 **코호트 분포 시각화 / 실험 디자인 LLM 도식 / R·Python·Bash 다운로드 스니펫** 3종 신규 섹션. **로컬 개발 환경에서 완성**, 자체 호스팅 (Oracle Cloud) 만 capacity 대기 중.

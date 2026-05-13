@@ -87,6 +87,9 @@ class OllamaClient:
             "prompt": prompt,
             "format": schema if schema is not None else "json",
             "stream": False,
+            # gemma4 / qwen3-thinking 등 reasoning-capable 모델은 think tokens 가 응답을
+            # 점거해 content 가 빈 채로 끝나는 사례 있음 → 비활성화. 비-reasoning 모델에는 무영향.
+            "think": False,
         }
         if options:
             body["options"] = options

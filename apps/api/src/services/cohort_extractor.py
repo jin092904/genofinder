@@ -234,6 +234,8 @@ async def extract_cohort_design_ondemand(
         "prompt": prompt,
         "format": "json",
         "stream": False,
+        # gemma4 등 thinking-capable 모델 비활성화 (비-thinking 모델엔 무영향).
+        "think": False,
     }
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:

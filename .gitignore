@@ -56,6 +56,18 @@ data/local/
 qdrant_storage/
 opensearch_data/
 
+# A100 native-stack runtime data + binaries (per `scripts/a100-native-bootstrap.sh`).
+# 컨테이너 stack 대체로 호스트 직접 실행 → repo 루트에 data 디렉터리들이 생김.
+# repo-root 한정 (`/`-prefix) — apps/api/src/services 같은 코드 디렉터리와 충돌 회피.
+/pgdata/
+/redis-data/
+/qdrant-data/
+/opensearch-data/
+/kms-data/
+/ollama-models/
+/services/
+/dumps/
+
 # Build artifacts
 *.tsbuildinfo
 .next/

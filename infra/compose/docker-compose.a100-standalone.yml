@@ -20,7 +20,8 @@ name: genofinder-dev
 
 services:
   postgres:
-    image: postgres:16-bookworm
+    # podman 은 short-name 거부 — docker.io fully-qualified.
+    image: docker.io/library/postgres:16-bookworm
     environment:
       POSTGRES_DB: genofinder
       POSTGRES_USER: genofinder
@@ -37,7 +38,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - ${GENOFINDER_DATA_ROOT}/redis-data:/data
@@ -45,7 +46,7 @@ services:
       - "6379:6379"
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: docker.io/qdrant/qdrant:latest
     volumes:
       - ${GENOFINDER_DATA_ROOT}/qdrant-data:/qdrant/storage
     ports:
@@ -53,7 +54,7 @@ services:
       - "6334:6334"
 
   opensearch:
-    image: opensearchproject/opensearch:2
+    image: docker.io/opensearchproject/opensearch:2
     environment:
       discovery.type: single-node
       OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_PASSWORD:-DevAdmin!1}
@@ -68,7 +69,7 @@ services:
       - "9200:9200"
 
   ollama:
-    image: ollama/ollama:latest
+    image: docker.io/ollama/ollama:latest
     volumes:
       - ${GENOFINDER_DATA_ROOT}/ollama-models:/root/.ollama
     ports:
@@ -83,7 +84,7 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "1"
 
   kms:
-    image: localstack/localstack:3
+    image: docker.io/localstack/localstack:3
     environment:
       SERVICES: kms
       DEBUG: "0"

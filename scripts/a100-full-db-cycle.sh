@@ -5,11 +5,23 @@
 #   1. NCBI API key 사용 (rate 10 rps)
 #   2. GEO --days 무한 + --max 1,000,000 (전체 GEO ~284k)
 #   3. HCA full backfill (since=2010-01-01)
-#   4. LLM 추출을 2 process 분할 — stride/offset 으로 같은 ollama (num_parallel=2) 에 동시 호출
-#   5. Ollama 재시작: GPU 2장 (5,0) + OLLAMA_NUM_PARALLEL=2
+#   4. LLM 추출을 N process 분할 — stride/offset 으로 같은 ollama (num_parallel=N) 에 동시 호출
+#   5. Ollama 재시작: 자동 탐지한 비어있는 GPU N장 사용
 #
-# 예상 wall-clock: 7-10 일 (병목 = LLM 추출, NCBI key + 2 process 가속 후).
+# 환경변수 (모두 옵션):
+#   FULLCYCLE_TARGET_GPUS   사용할 GPU 최대 갯수 (기본 4, min 1, max 6)
+#   FULLCYCLE_MIN_FREE_GB   "비어있다" 기준 (기본 70 GiB free)
+#
+# 예상 wall-clock (NCBI key + GPU 다중):
+#   1 GPU : 약 14 일
+#   2 GPU : 약 7-10 일
+#   3 GPU : 약 5-7 일
+#   4 GPU : 약 3-5 일
 set -euo pipefail
+
+# 사용자 매개변수
+FULLCYCLE_TARGET_GPUS="${FULLCYCLE_TARGET_GPUS:-4}"
+FULLCYCLE_MIN_FREE_GB="${FULLCYCLE_MIN_FREE_GB:-70}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
@@ -47,16 +59,22 @@ if [ -n "$OLLAMA_PIDS" ]; then
   sleep 3
 fi
 
-# GPU 가용성 체크 (5, 0 우선; 점거 시 비어있는 2 장 찾기)
-GPUS_FREE=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader | \
-  awk -F', ' '$2 ~ /^7[0-9]+/ || $2 ~ /^[8-9][0-9]+/ {print $1}' | head -2 | paste -sd ,)
-if [ -z "$GPUS_FREE" ] || [ "$(echo "$GPUS_FREE" | tr ',' '\n' | wc -l)" -lt 2 ]; then
-  say_warn "비어있는 GPU 2장 미발견 — GPU 1장 mode 로 fallback"
+# GPU 가용성 자동 탐지 — memory.free >= ${FULLCYCLE_MIN_FREE_GB} GiB 인 GPU 들 중
+# 최대 ${FULLCYCLE_TARGET_GPUS} 장 선택.
+MIN_FREE_MIB=$((FULLCYCLE_MIN_FREE_GB * 1024))
+GPUS_FREE_LIST=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | \
+  awk -F', ' -v t="$MIN_FREE_MIB" '$2 >= t {print $1}' | head -n "$FULLCYCLE_TARGET_GPUS")
+GPUS_COUNT=$(echo "$GPUS_FREE_LIST" | grep -c '.' || echo 0)
+GPUS_FREE=$(echo "$GPUS_FREE_LIST" | paste -sd ,)
+
+if [ "$GPUS_COUNT" -eq 0 ]; then
+  say_warn "비어있는 GPU 미발견 (>= ${FULLCYCLE_MIN_FREE_GB} GiB) — env 의 NVIDIA_GPU_DEVICE_ID fallback"
   GPUS_FREE="${NVIDIA_GPU_DEVICE_ID:-5}"
   PARALLEL=1
 else
-  echo "  사용할 GPU: $GPUS_FREE (2장 split)"
-  PARALLEL=2
+  PARALLEL="$GPUS_COUNT"
+  echo "  탐지된 비어있는 GPU: $GPUS_FREE ($GPUS_COUNT 장)"
+  echo "  → OLLAMA_NUM_PARALLEL=$PARALLEL, reextract stride=$PARALLEL"
 fi
 
 cd "$REPO_ROOT/services/ollama"
@@ -124,20 +142,24 @@ time uv run python -m scripts.harvest_geo_samples --limit 1000000 --concurrency 
   say_warn "samples backfill 일부 실패 — 다음 단계 계속"
 
 # ============================================================================
-say "4/7 LLM 추출 — 2 process 분할 (stride=2)"
+say "4/7 LLM 추출 — $PARALLEL process 분할 (stride=$PARALLEL)"
 if [ "$PARALLEL" -ge 2 ]; then
-  echo "  process A (stride=2 offset=0) + process B (stride=2 offset=1) 동시 실행"
-  uv run python scripts/reextract_with_ontology.py --offset 0 --stride 2 \
-    > /tmp/reextract-A.log 2>&1 &
-  PID_A=$!
-  uv run python scripts/reextract_with_ontology.py --offset 1 --stride 2 \
-    > /tmp/reextract-B.log 2>&1 &
-  PID_B=$!
-  echo "  PID_A=$PID_A PID_B=$PID_B"
-  wait $PID_A
-  echo "  process A finished (exit $?)"
-  wait $PID_B
-  echo "  process B finished (exit $?)"
+  REEXTRACT_PIDS=()
+  for OFFSET in $(seq 0 $((PARALLEL - 1))); do
+    uv run python scripts/reextract_with_ontology.py \
+      --offset "$OFFSET" --stride "$PARALLEL" \
+      > "/tmp/reextract-${OFFSET}.log" 2>&1 &
+    REEXTRACT_PIDS+=($!)
+    echo "  spawned process offset=$OFFSET PID=$!"
+  done
+  for PID in "${REEXTRACT_PIDS[@]}"; do
+    if wait "$PID"; then
+      echo "  PID $PID finished OK"
+    else
+      RC=$?
+      say_warn "PID $PID failed (exit $RC) — 부분 추출 손실, 후속 단계 계속"
+    fi
+  done
 else
   echo "  single process (parallel=1)"
   time uv run python scripts/reextract_with_ontology.py

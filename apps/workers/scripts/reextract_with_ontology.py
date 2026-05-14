@@ -34,12 +34,25 @@ from src.indexer.lexical import (
 from src.ontology.mapper import OntologyMapper
 
 
-async def reextract(limit: int | None = None) -> None:
+async def reextract(
+    limit: int | None = None,
+    offset: int = 0,
+    stride: int = 1,
+) -> None:
+    """
+    stride/offset 을 통해 같은 corpus 를 N 개 process 로 분할 가능 (manual parallelism).
+    예) 2 process: process A `--offset 0 --stride 2`, process B `--offset 1 --stride 2`
+    """
     eng = get_engine()
     async with eng.connect() as conn:
         q = text("SELECT id, source_db, source_id, title, abstract FROM datasets WHERE title IS NOT NULL")
         result = await conn.execute(q)
-        rows = list(result.fetchall())
+        all_rows = list(result.fetchall())
+    if stride > 1:
+        rows = [r for i, r in enumerate(all_rows) if i % stride == offset]
+        print(f"split: offset={offset} stride={stride} → {len(rows)}/{len(all_rows)} records")
+    else:
+        rows = all_rows
     if limit:
         rows = rows[:limit]
     print(f"reextracting {len(rows)} records...")
@@ -119,8 +132,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None,
                         help="optional cap (test runs)")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="(parallel split) 시작 인덱스. 0 ~ stride-1")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="(parallel split) row stride. 2 면 모든 짝수/홀수 row 만 처리")
     args = parser.parse_args()
-    asyncio.run(reextract(limit=args.limit))
+    asyncio.run(reextract(limit=args.limit, offset=args.offset, stride=args.stride))
 
 
 if __name__ == "__main__":

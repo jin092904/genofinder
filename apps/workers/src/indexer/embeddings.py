@@ -124,7 +124,7 @@ async def upsert_embedding(
     text = _compose_text(dataset_row)
     if not text:
         raise ValueError(f"empty text for dataset_id={dataset_row['id']}")
-    vectors = await ollama.embed(text)
+    vectors = await ollama.embed(text, truncate_dim=EMBED_DIM)
     vec = vectors[0]
     if len(vec) != EMBED_DIM:
         raise ValueError(
@@ -179,9 +179,15 @@ async def upsert_many(
         active_indexes = [j for j, t in enumerate(texts) if t]
         if not active_indexes:
             continue
-        vectors = await ollama.embed([texts[j] for j in active_indexes])
+        vectors = await ollama.embed([texts[j] for j in active_indexes], truncate_dim=EMBED_DIM)
         if len(vectors) != len(active_indexes):
             raise RuntimeError(f"embed batch returned {len(vectors)} vectors, expected {len(active_indexes)}")
+        # 방어: batch 의 첫 벡터만 dim 검증 (truncate_dim 이 적용됐다면 항상 EMBED_DIM)
+        if vectors and len(vectors[0]) != EMBED_DIM:
+            raise ValueError(
+                f"embed batch dim mismatch: got {len(vectors[0])} expected {EMBED_DIM} "
+                "(check OLLAMA_MODEL_EMBED — model 변경 시 collection 재생성 필요)"
+            )
         points = []
         for j, vec in zip(active_indexes, vectors):
             row = batch[j]

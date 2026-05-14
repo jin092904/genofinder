@@ -52,11 +52,24 @@ class OllamaClient:
 
     # ---- Embeddings ----
 
-    async def embed(self, text: str | list[str], model: str | None = None) -> list[list[float]]:
-        """nomic-embed-text 기본. 입력 문자열(들) → 임베딩(들).
+    async def embed(
+        self,
+        text: str | list[str],
+        model: str | None = None,
+        truncate_dim: int | None = None,
+    ) -> list[list[float]]:
+        """입력 문자열(들) → 임베딩(들).
 
         반환: list[list[float]] — 단일 입력이라도 배열 안에 한 벡터.
         L2-normalized 여부는 모델에 따라 다르다 (nomic-embed-text 는 norm=1.0 — 직접 검증).
+
+        ADR 0006: 인덱싱 시 Qwen3-Embedding-8B 는 native 4096d 를 반환. Matryoshka
+        Representation Learning 으로 학습되어 앞부분 [:truncate_dim] 슬라이스가 동일
+        의미를 보존한다 (truncate_dim=1024 가 기본 권장). truncate_dim 이 주어지지
+        않으면 모델의 native dim 을 그대로 반환.
+
+        검증: 응답이 truncate_dim 보다 짧으면 ValueError — 차원 부족이 의미상 잘못된
+        모델 선택일 가능성이 높아 silent pad 보다 명시적 실패가 안전.
         """
         body = {
             "model": model or self._embed_model,
@@ -65,7 +78,17 @@ class OllamaClient:
         resp = await self._client.post("/api/embed", json=body)
         resp.raise_for_status()
         data = resp.json()
-        return data["embeddings"]
+        embeddings: list[list[float]] = data["embeddings"]
+        if truncate_dim is not None and embeddings:
+            native_dim = len(embeddings[0])
+            if native_dim < truncate_dim:
+                raise ValueError(
+                    f"embed response dim {native_dim} is smaller than truncate_dim={truncate_dim} "
+                    f"(check OLLAMA_MODEL_EMBED — model 변경 시 EMBED_DIM 갱신 필요)"
+                )
+            if native_dim > truncate_dim:
+                embeddings = [v[:truncate_dim] for v in embeddings]
+        return embeddings
 
     # ---- Generation (구조화 추출용) ----
 

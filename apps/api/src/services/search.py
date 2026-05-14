@@ -78,14 +78,25 @@ def _build_os_filter(req: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def _embed_query(query_text: str) -> list[float]:
-    """ephemeral query 임베딩 — 호출 후 폐기."""
+    """ephemeral query 임베딩 — 호출 후 폐기.
+
+    ADR 0006: 인덱스는 1024d (Qwen3-Embedding-8B Matryoshka truncate). 쿼리 모델이
+    8B (4096d native) 이든 0.6B (1024d native) 이든, Qdrant collection dim 과
+    일치시키기 위해 클라이언트 측에서 [:1024] truncate.
+    """
     ollama_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
-    # ADR 0006: Qwen3-Embedding 시리즈. 쿼리 시점은 0.6B (1024d native).
     model = os.environ.get("OLLAMA_MODEL_EMBED", "qwen3-embedding:0.6b")
     async with httpx.AsyncClient(base_url=ollama_url, timeout=30.0) as cli:
         resp = await cli.post("/api/embed", json={"model": model, "input": query_text})
         resp.raise_for_status()
-        return resp.json()["embeddings"][0]
+        vec = resp.json()["embeddings"][0]
+    QDRANT_DIM = 1024  # datasets_v2 collection 의 차원 — embeddings.py:EMBED_DIM 과 sync
+    if len(vec) < QDRANT_DIM:
+        raise RuntimeError(
+            f"query embedding dim {len(vec)} < {QDRANT_DIM}: OLLAMA_MODEL_EMBED 가 "
+            "1024d 미만 모델로 설정됨. qwen3-embedding:8b 또는 :0.6b 권장."
+        )
+    return vec[:QDRANT_DIM]
 
 
 async def hybrid_search(req: dict[str, Any]) -> dict[str, Any]:

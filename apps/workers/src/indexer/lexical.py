@@ -118,25 +118,41 @@ async def upsert_doc(client: AsyncOpenSearch, row: dict[str, Any]) -> str:
     return pid
 
 
-async def upsert_many(client: AsyncOpenSearch, rows: list[dict[str, Any]]) -> int:
-    """Bulk index."""
+async def upsert_many(
+    client: AsyncOpenSearch,
+    rows: list[dict[str, Any]],
+    batch_size: int = 1000,
+) -> int:
+    """Bulk index in batches.
+
+    OpenSearch 의 기본 `http.max_content_length` = 100MB. v1.0 의 28만 record 코퍼스
+    (각 ~5KB) 는 한 번에 1.4GB 라 413 (Payload Too Large) 가 발생 (2026-05-15 사고).
+    batch_size 단위로 분할 호출하여 회피. 기본 1000 records ≈ 5MB 페이로드.
+    """
     if not rows:
         return 0
-    bulk_body = []
-    for row in rows:
-        pid = str(row["id"])
-        bulk_body.append({"index": {"_index": INDEX_NAME, "_id": pid}})
-        bulk_body.append(_doc(row))
-    resp = await client.bulk(body=bulk_body, refresh=True)
-    if resp.get("errors"):
-        # errored items 만 추려서 logger 로 노출 (본문에 SENSITIVE 없음 — L0)
-        errs = [
-            item for item in resp["items"]
-            if item.get("index", {}).get("error")
-        ]
-        if errs:
-            logger.warning("opensearch bulk had %d errors (first: %s)", len(errs), errs[0])
-    return len(rows)
+    total = 0
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i : i + batch_size]
+        bulk_body = []
+        for row in chunk:
+            pid = str(row["id"])
+            bulk_body.append({"index": {"_index": INDEX_NAME, "_id": pid}})
+            bulk_body.append(_doc(row))
+        # refresh=False 로 thoughput 우선; 마지막 batch 만 refresh=True
+        is_last = (i + batch_size) >= len(rows)
+        resp = await client.bulk(body=bulk_body, refresh=is_last)
+        if resp.get("errors"):
+            errs = [item for item in resp["items"] if item.get("index", {}).get("error")]
+            if errs:
+                logger.warning(
+                    "opensearch bulk chunk %d-%d had %d errors (first: %s)",
+                    i, i + len(chunk), len(errs), errs[0],
+                )
+        total += len(chunk)
+        if (i // batch_size) % 10 == 9:  # 매 10 batch 마다
+            logger.info("opensearch bulk progress: %d/%d", total, len(rows))
+    return total
 
 
 async def search_bm25(

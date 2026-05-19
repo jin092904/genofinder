@@ -4,15 +4,16 @@
 사용. 본 client 가 schema 를 *재정의* 하지 않고, 호환 가능한 minimal model 만 정의 (api
 패키지를 evaluation 패키지가 import 하지 않도록 — 결합도 최소화).
 
-Step 2.5 API patch 후 `SearchRequest` 에 `mode: SearchMode` 와 `corpus: str` field 가
-추가된다고 가정. 본 client 는 그 field 를 그대로 전달.
+Step 2.5 API patch 이후 (commit e9f757d) `SearchRequest` 에 `mode: SearchMode` 와
+`corpus: Literal["production","biocaddie_2016_eval"]` field 가 추가됨. 본 client 는
+그 field 를 body 에 그대로 실어 보낸다.
 
-TODO (Step 2 구현):
-- async retry (tenacity, 5xx → exponential backoff max 3, 1s → 2s → 4s)
-- timeout 60s
-- Bearer token auth (env GENOFINDER_BEARER_TOKEN)
-- `GenoFinderUnavailable` exception (API 다운 시)
-- structlog 구조화 로그 (query_text redact)
+Retry / error 정책:
+  - 5xx: exponential backoff max 3 retry (1s → 2s → 4s)
+  - 4xx (400/401/403): 즉시 raise GenoFinderUnavailable (사용자 오류 / 인증)
+  - timeout / connect error: retry 후 GenoFinderUnavailable
+  - Bearer token 우선순위: 인자 > GENOFINDER_BEARER_TOKEN env
+  - query_text 는 structlog redact 처리.
 """
 from __future__ import annotations
 
@@ -20,9 +21,19 @@ import os
 from typing import Any, Literal
 
 import httpx
+import structlog
 from pydantic import BaseModel
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from genofinder_eval.client.search_modes import SearchMode
+from genofinder_eval.utils.logging import get_logger
+
+logger: structlog.stdlib.BoundLogger = get_logger(__name__)
 
 
 class GenoFinderUnavailable(RuntimeError):
@@ -50,6 +61,15 @@ class _SearchResponseMin(BaseModel):
     query_id: str
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """5xx 또는 transient network error 만 retry. 4xx 는 즉시 fail."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    if isinstance(exc, httpx.TransportError | httpx.TimeoutException):
+        return True
+    return False
+
+
 class GenoFinderClient:
     """async wrapper for `/api/v1/search`.
 
@@ -65,7 +85,9 @@ class GenoFinderClient:
         timeout_s: float = 60.0,
     ) -> None:
         self._base = (base_url or os.environ.get("GENOFINDER_API_BASE", "http://localhost:8000")).rstrip("/")
-        self._token = bearer_token if bearer_token is not None else os.environ.get("GENOFINDER_BEARER_TOKEN", "")
+        self._token = (
+            bearer_token if bearer_token is not None else os.environ.get("GENOFINDER_BEARER_TOKEN", "")
+        )
         self._timeout = timeout_s
         self._client: httpx.AsyncClient | None = None
 
@@ -91,11 +113,66 @@ class GenoFinderClient:
         corpus: str = "production",
         filters: dict[str, Any] | None = None,
     ) -> _SearchResponseMin:
-        """Geno Finder `/api/v1/search` 호출. 자세한 retry / error 처리는 Step 2 에서 채움.
+        """Geno Finder `/api/v1/search` 호출.
 
-        Step 2.5 API patch 후 body schema:
-            { query_text, mode, corpus, page, page_size=top_k, ... }
-        `mode != rrf_rerank` 호출은 헤더 `X-Eval-Mode: 1` 필수.
+        Args:
+            query_text: 검색 query.
+            top_k: 결과 갯수 상한 (api 의 page_size 에 매핑, 1-100).
+            mode: 4-system ablation 모드. non-default 시 X-Eval-Mode 헤더 자동 추가.
+            lang: 평가 메타정보 (request body 에 직접 사용 안 함, log 만).
+            corpus: 'production' | 'biocaddie_2016_eval'.
+            filters: api `SearchRequest` 의 기타 필드 (modality / disease_ids 등).
+
+        Raises:
+            GenoFinderUnavailable: 5xx retry 초과, timeout, connect error, 4xx (즉시).
         """
-        # TODO(step-2): 본 함수 구현 — body 구성 + retry + error handling + redacted logging.
-        raise NotImplementedError("Step 2 에서 구현. 본 skeleton 은 시그니처만 fix.")
+        if self._client is None:
+            raise RuntimeError("Use `async with GenoFinderClient()` context manager.")
+
+        body: dict[str, Any] = {
+            "query_text": query_text,
+            "mode": str(mode),
+            "corpus": corpus,
+            "page": 1,
+            "page_size": max(1, min(100, top_k)),
+        }
+        if filters:
+            body.update(filters)
+
+        headers: dict[str, str] = {}
+        if mode != SearchMode.RRF_RERANK or corpus != "production":
+            headers["X-Eval-Mode"] = "1"
+
+        logger.info(
+            "search_request",
+            mode=str(mode),
+            corpus=corpus,
+            top_k=top_k,
+            lang=lang,
+            query_text=query_text,  # redact processor 가 masking
+        )
+
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=4),
+            retry=retry_if_exception(_is_retryable),
+            reraise=True,
+        ):
+            with attempt:
+                try:
+                    resp = await self._client.post(
+                        "/api/v1/search", json=body, headers=headers
+                    )
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    if not _is_retryable(e):
+                        # 4xx — 즉시 raise (retry 안 함)
+                        raise GenoFinderUnavailable(
+                            f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+                        ) from e
+                    raise
+                except (httpx.TransportError, httpx.TimeoutException):
+                    raise
+
+        data = resp.json()
+        return _SearchResponseMin.model_validate(data)

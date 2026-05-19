@@ -23,6 +23,17 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 # ADR 0006: v2 = Qwen3-Embedding 1024d. v1 (768d nomic) deprecated.
 QDRANT_COLLECTION = "datasets_v2"
 OS_INDEX = "datasets_v2"
+
+# Evaluation 용 corpus switch — production 외에 bioCADDIE OOD generalization 평가.
+EVAL_CORPUS_QDRANT = {
+    "production": QDRANT_COLLECTION,
+    "biocaddie_2016_eval": "biocaddie_2016_eval",
+}
+EVAL_CORPUS_OS = {
+    "production": OS_INDEX,
+    "biocaddie_2016_eval": "biocaddie_2016_eval",
+}
+
 DEFAULT_OLLAMA_URL = "http://ollama:11434"
 DEFAULT_QDRANT_URL = "http://qdrant:6333"
 DEFAULT_OS_URL = "http://opensearch:9200"
@@ -109,6 +120,8 @@ async def hybrid_search(req: dict[str, Any]) -> dict[str, Any]:
         access_preference   ('any' | 'open_only')
         must_have_processed_data (bool)
         page, page_size     (int)
+        mode                ('bm25_only' | 'dense_only' | 'rrf' | 'rrf_rerank', 기본 rrf_rerank)
+        corpus              ('production' | 'biocaddie_2016_eval', 기본 production)
     """
     t0 = time.perf_counter()
     query_text: str = req["query_text"]
@@ -118,6 +131,15 @@ async def hybrid_search(req: dict[str, Any]) -> dict[str, Any]:
     # buffer 1.5x + bound.
     top_k = max(MIN_top_k, min(MAX_top_k, int(page * page_size * 1.5)))
 
+    # Mode 분기 + corpus switch (ADR 0006 evaluation)
+    mode = req.get("mode", "rrf_rerank")
+    corpus = req.get("corpus", "production")
+    qdrant_collection = EVAL_CORPUS_QDRANT.get(corpus, QDRANT_COLLECTION)
+    os_index = EVAL_CORPUS_OS.get(corpus, OS_INDEX)
+    use_dense = mode in ("dense_only", "rrf", "rrf_rerank")
+    use_lexical = mode in ("bm25_only", "rrf", "rrf_rerank")
+    use_rerank = mode == "rrf_rerank"
+
     qdrant = AsyncQdrantClient(url=os.environ.get("QDRANT_URL", DEFAULT_QDRANT_URL))
     os_client = AsyncOpenSearch(
         hosts=[os.environ.get("OPENSEARCH_URL", DEFAULT_OS_URL)],
@@ -125,58 +147,62 @@ async def hybrid_search(req: dict[str, Any]) -> dict[str, Any]:
     )
 
     try:
-        # 1) Embed query
-        qvec = await _embed_query(query_text)
+        # 1) Embed query (dense 미사용 시 skip)
+        qd_hits_points: list[Any] = []
+        if use_dense:
+            qvec = await _embed_query(query_text)
+            qd_filter = _build_qdrant_filter(req)
+            qd_resp = await qdrant.query_points(
+                collection_name=qdrant_collection,
+                query=qvec,
+                limit=top_k,
+                query_filter=qd_filter,
+                with_payload=True,
+            )
+            qd_hits_points = qd_resp.points
 
-        # 2) Qdrant top K
-        qd_filter = _build_qdrant_filter(req)
-        qd_hits = await qdrant.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=qvec,
-            limit=top_k,
-            query_filter=qd_filter,
-            with_payload=True,
-        )
-
-        # 3) OpenSearch top K
-        os_filters = _build_os_filter(req)
-        os_resp = await os_client.search(
-            index=OS_INDEX,
-            body={
-                "size": top_k,
-                "query": {
-                    "bool": {
-                        "must": [{
-                            "multi_match": {
-                                "query": query_text,
-                                # source_id boost 15 — accession 직접 검색 (예: "GSE317412")
-                                # 시 해당 데이터셋이 BM25 상위에 잡힘.
-                                "fields": [
-                                    "source_id^15",
-                                    "title^3",
-                                    "abstract",
-                                    "platform",
-                                    "library_strategy",
-                                ],
-                                "type": "best_fields",
-                            }
-                        }],
-                        "filter": os_filters,
-                    }
+        # 3) OpenSearch top K (lexical 미사용 시 skip)
+        os_hits: list[dict[str, Any]] = []
+        if use_lexical:
+            os_filters = _build_os_filter(req)
+            os_resp = await os_client.search(
+                index=os_index,
+                body={
+                    "size": top_k,
+                    "query": {
+                        "bool": {
+                            "must": [{
+                                "multi_match": {
+                                    "query": query_text,
+                                    # source_id boost 15 — accession 직접 검색 (예: "GSE317412")
+                                    # 시 해당 데이터셋이 BM25 상위에 잡힘.
+                                    "fields": [
+                                        "source_id^15",
+                                        "title^3",
+                                        "abstract",
+                                        "platform",
+                                        "library_strategy",
+                                    ],
+                                    "type": "best_fields",
+                                }
+                            }],
+                            "filter": os_filters,
+                        }
+                    },
                 },
-            },
-        )
+            )
+            os_hits = os_resp["hits"]["hits"]
 
-        # 4) RRF merge
+        # 4) Merge — mode 에 따라 RRF 또는 단독 ranker score 채용
         merged: dict[str, HybridHit] = {}
-        for rank, p in enumerate(qd_hits.points, start=1):
+        for rank, p in enumerate(qd_hits_points, start=1):
             did = str(p.id)
             merged[did] = HybridHit(
                 dataset_id=did, payload=p.payload or {},
                 semantic=float(p.score), semantic_rank=rank,
-                rrf=1.0 / (RRF_K + rank),
+                rrf=1.0 / (RRF_K + rank) if use_lexical else float(p.score),
             )
-        for rank, h in enumerate(os_resp["hits"]["hits"], start=1):
+        for rank, h in enumerate(os_hits, start=1):
             did = h["_id"]
             payload = h["_source"]
             score = float(h["_score"])
@@ -187,40 +213,46 @@ async def hybrid_search(req: dict[str, Any]) -> dict[str, Any]:
                 # OpenSearch source 의 title/abstract 등을 payload 에 보강
                 hit.payload = {**hit.payload, **payload}
             else:
+                # lexical 단독 (bm25_only) 또는 dense 가 miss 한 doc
+                rrf_init = 1.0 / (RRF_K + rank) if use_dense else score
                 merged[did] = HybridHit(
                     dataset_id=did, payload=payload,
                     lexical=score, lexical_rank=rank,
-                    rrf=1.0 / (RRF_K + rank),
+                    rrf=rrf_init,
                 )
 
-        # 5) Sort by RRF
-        ordered = sorted(merged.values(), key=lambda x: x.rrf, reverse=True)
+        # 5) Sort
+        if mode == "bm25_only":
+            ordered = sorted(merged.values(), key=lambda x: x.lexical or 0.0, reverse=True)
+        elif mode == "dense_only":
+            ordered = sorted(merged.values(), key=lambda x: x.semantic or 0.0, reverse=True)
+        else:
+            ordered = sorted(merged.values(), key=lambda x: x.rrf, reverse=True)
         total = len(ordered)
 
-        # 5b) Cross-encoder rerank (top-N) — 가능할 때만, fallback 은 RRF
-        from src.services.reranker import is_available as rerank_available
-        from src.services.reranker import rerank_pairs, rerank_top_n
+        # 5b) Cross-encoder rerank (mode == rrf_rerank 일 때만)
+        if use_rerank:
+            from src.services.reranker import is_available as rerank_available
+            from src.services.reranker import rerank_pairs, rerank_top_n
 
-        rerank_n = rerank_top_n()
-        if rerank_available() and len(ordered) > 0:
-            top = ordered[:rerank_n]
-            docs = []
-            for h in top:
-                p = h.payload
-                title = p.get("title") or ""
-                abstract = (p.get("abstract") or "")[:1000]
-                docs.append(f"{title}\n\n{abstract}")
-            # CPU-bound (PyTorch inference). 별도 thread 로 빼서 event loop 비움.
-            # 안 그러면 reranker 도는 1-3초 동안 다른 요청 (예: /me/saved POST) 가
-            # queue 에 쌓이며 브라우저가 timeout/reset.
-            import asyncio
-            scores = await asyncio.to_thread(rerank_pairs, query_text, docs)
-            if scores is not None:
-                for h, s in zip(top, scores):
-                    h.rerank = s
-                # rerank 점수 기준 재정렬 — 못 받은 (top-N 밖) 은 그대로 후순위
-                top_sorted = sorted(top, key=lambda x: x.rerank or float("-inf"), reverse=True)
-                ordered = top_sorted + ordered[rerank_n:]
+            rerank_n = rerank_top_n()
+            if rerank_available() and len(ordered) > 0:
+                top = ordered[:rerank_n]
+                docs = []
+                for h in top:
+                    p = h.payload
+                    title = p.get("title") or ""
+                    abstract = (p.get("abstract") or "")[:1000]
+                    docs.append(f"{title}\n\n{abstract}")
+                # CPU-bound (PyTorch inference). 별도 thread 로 빼서 event loop 비움.
+                import asyncio
+                scores = await asyncio.to_thread(rerank_pairs, query_text, docs)
+                if scores is not None:
+                    for h, s in zip(top, scores):
+                        h.rerank = s
+                    # rerank 점수 기준 재정렬 — 못 받은 (top-N 밖) 은 그대로 후순위
+                    top_sorted = sorted(top, key=lambda x: x.rerank or float("-inf"), reverse=True)
+                    ordered = top_sorted + ordered[rerank_n:]
 
         start = (page - 1) * page_size
         chunk = ordered[start : start + page_size]

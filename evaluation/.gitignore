@@ -1,0 +1,31 @@
+# Geno Finder evaluation — gitignore (Step 1 skeleton).
+
+# Python build / venv
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets / env
+.env
+.env.local
+
+# bioCADDIE / 외부 corpus 본체 (가능한 라이선스 미허용 → repo commit 금지).
+# fetch script 만 commit, 데이터 자체는 /var/tmp 에 저장 + symlink.
+data/biocaddie/corpus.jsonl
+data/biocaddie/queries.jsonl
+data/biocaddie/qrels/*.tsv
+data/biocaddie/*.zip
+data/biocaddie/*.tar.gz
+
+# Result run / aggregate / figure 출력은 작은 CSV / figure 만 commit, raw run 파일은 ignore.
+results/raw/
+
+# 임시
+*.log
+*.tmp
